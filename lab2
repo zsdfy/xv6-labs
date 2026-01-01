@@ -1,0 +1,174 @@
+一．	实验环境准备
+
+git fetch
+git checkout syscall
+make clean
+
+
+二．	实验2.2
+1.	修改Makefile，添加trace程序：打开Makefile，找到UPROGS部分，在末尾添加以下内容然后保存退出：
+
+	$U/_trace\
+
+ 
+2.	添加系统调用声明到user/user.h：
+
+int trace(int); 
+
+ 
+3.	添加系统调用入口到user/usys.pl：
+
+entry("trace");
+
+ 
+4.	添加系统调用号到kernel/syscall.h，在已有定义后面添加：
+
+#define SYS_trace  22
+
+ 
+5.	在进程结构体中添加trace掩码字段。打开kernel/proc.h，找到struct proc定义，添加mask字段：
+
+int mask;
+
+ 
+6.	实现trace系统调用函数。打开kernel/sysproc.c，在文件末尾添加：
+
+uint64
+sys_trace(void)
+{
+  int mask;
+  
+  if(argint(0, &mask) < 0) return -1;
+  
+
+// 设置当前进程的trace掩码
+  myproc()->mask = mask;
+  return 0;
+}
+
+ 
+7.	打开kernel/proc.c，找到fork函数，在复制进程信息的部分（np->cwd = idup(p->cwd);）后面添加：
+
+// 复制trace掩码
+np->mask = p->mask;   
+
+ 
+8.	打开kernel/syscall.c，在文件开头附近添加系统调用名称数组：
+  
+static char* syscall_names[] = {
+  [SYS_fork]    "fork",
+  [SYS_exit]    "exit",
+  [SYS_wait]    "wait",
+  [SYS_pipe]    "pipe",
+  [SYS_read]    "read",
+  [SYS_kill]    "kill",
+  [SYS_exec]    "exec",
+  [SYS_fstat]   "fstat",
+  [SYS_chdir]   "chdir",
+  [SYS_dup]     "dup",
+  [SYS_getpid]  "getpid",
+  [SYS_sbrk]    "sbrk",
+  [SYS_sleep]   "sleep",
+  [SYS_uptime]  "uptime",
+  [SYS_open]    "open",
+  [SYS_write]   "write",
+  [SYS_mknod]   "mknod",
+  [SYS_unlink]  "unlink",
+  [SYS_link]    "link",
+  [SYS_mkdir]   "mkdir",
+  [SYS_close]   "close",
+  [SYS_trace]   "trace", 
+};
+
+ 
+9.	在同一个文件(kernel/syscall.c)中，找到syscall函数（void syscall(void)），在函数内部修改，添加trace输出逻辑。即将以下部分：
+
+num = p->trapframe->a7;
+if(num>0 && num<NELEM(syscalls) && syscalls[num]) {
+  p->trapframe->a0 = syscalls[num]();
+} else {
+  // ... 
+}    
+
+    改为以下部分：
+
+num = p->trapframe->a7;
+if(num>0 && num<NELEM(syscalls) && syscalls[num]) {
+  p->trapframe->a0 = syscalls[num]();
+  
+  // 添加trace输出
+  if((p->mask & (1 << num)) != 0) {
+    printf("%d: syscall %s -> %d\n", 
+           p->pid, syscall_names[num], p->trapframe->a0);
+  }
+} else {
+  // ... 
+}        
+        close(p[1]);
+        exit(0);
+    }
+}
+
+ 
+10.	在同一个文件(kernel/syscall.c)中，找到extern声明部分，添加：
+
+
+extern uint64 sys_trace(void);
+    
+ 
+找到系统调用数组，添加：
+ 
+    [SYS_trace]   sys_trace,
+    
+ 
+11.	编译xv6：
+      
+ make qemu
+
+	测试：
+
+# 测试1：追踪read系统调用
+trace 32 grep hello README
+
+# 测试2：追踪所有系统调用
+trace 2147483647 grep hello README
+
+# 测试3：追踪fork系统调用
+trace 2 usertests forkforkfork
+
+	测试1截图：
+ 
+	测试2截图：
+ 
+	测试3截图：
+ 
+ 
+三．	实验2.3
+1.	打开nano user/attack.c实现attack.c：
+int main(int argc, char *argv[]) {
+    char *end = sbrk(17*PGSIZE);  // 分配17个页面
+    end += 16 * PGSIZE;                 // 移动到第17个页面
+    write(2, end+32, 8);        
+    exit(1);
+}
+2.	测试攻击：
+
+make qemu
+
+attacktest
+
+ 
+3.	思考题分析：
+1)	为什么秘密数据存放在 end+32 的偏移处，而不是页面起始位置？
+页面起始位置通常包含重要的元数据或指针，将秘密数据放在偏移处可以减少对正常程序运行的干扰。
+2)	如果 secret.c 将秘密数据直接写入页面起始位置，攻击是否依然有效？
+攻击依然有效，原因如下：
+(1)	内存分配机制不变：kalloc 仍然会分配 secret 进程刚刚释放的页面。
+(2)	内存页面未被清空的问题依然存在。
+四．	实验主观心得
+本次实验让我对操作系统的内部机制有了更深入的理解，特别是系统调用的实现和内存管理的安全性：
+1.	深入理解了系统调用机制：从用户态到内核态的完整流程，包括参数传递、权限切换、执行和返回。
+2.	学习了在现有操作系统中添加新功能的完整流程，包括接口定义、内核实现和用户程序调用。
+3.	通过攻击实验，深刻理解了内存隔离机制被破坏的严重后果，以及清空敏感数据的必要性。
+4.	提升了调试和问题解决能力：在实验过程中遇到多个编译和运行时错误，通过分析错误信息和查阅资料，逐步解决了这些问题。
+5.	操作系统必须提供安全的进程间通信机制，防止恶意程序窃取其他进程的敏感信息。
