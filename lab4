@@ -1,0 +1,308 @@
+一．	实验环境准备
+
+git fetch
+git checkout fs
+make clean
+
+
+二．	实验4.1 对 xv6 文件系统添加“大文件”的支持
+1.	在kernel/fs.h和kernel/file.h中修改宏定义和数据结构：
+
+//kernel/fs.h
+#define NDIRECT 11                    // 减少一个直接块用于二级间接块
+#define NINDIRECT (BSIZE / sizeof(uint)) // 每个间接块包含256个地址
+#define NTWOINDIRECT ((NINDIRECT)*(NINDIRECT)) // 二级间接块包含65536个地址
+#define MAXFILE (NDIRECT + NINDIRECT + NTWOINDIRECT) 
+// 最大文件块数：11+256+65536=65803
+
+struct dinode {
+  short type;
+  short major;
+  short minor;
+  short nlink;
+  uint size;
+  uint addrs[NDIRECT+2];  // 11个直接块 + 1个一级间接块 + 1个二级间接块
+};
+
+//kernel/file.h
+struct inode {
+  uint dev;
+  uint inum;
+  int ref;
+  struct sleeplock lock;
+  int valid;
+
+  short type;
+  short major;
+  short minor;
+  short nlink;
+  uint size;
+  uint addrs[NDIRECT+2];  // 与磁盘inode结构保持一致
+};
+
+ 
+ 
+2.	在 kernel/fs.c 中修改 bmap 函数，添加二级间接块支持：
+
+static uint
+bmap(struct inode *ip, uint bn)
+{
+  uint addr, *a;
+  struct buf *bp;
+  if(bn < NDIRECT)
+  {
+//获得直接块的地址，若为0就分配
+    if((addr = ip->addrs[bn]) == 0)
+      ip->addrs[bn] = addr = balloc(ip->dev);
+    return addr;
+  }
+  bn -= NDIRECT;
+  if(bn < NINDIRECT)
+  {
+    //获得一级间接块的地址，若为0就分配
+    if((addr = ip->addrs[NDIRECT]) == 0)
+      ip->addrs[NDIRECT] = addr = balloc(ip->dev);
+    bp = bread(ip->dev, addr);  //根据地址读一级间接块
+    a = (uint*)bp->data;  //一级间接块的数据指针
+    if((addr = a[bn]) == 0)
+    {
+//根据指针从相应偏移量处获得数据块地址，若为0就分配
+      a[bn] = addr = balloc(ip->dev);
+      log_write(bp);
+    }
+    //获得地址后释放一级间接块并返回
+    brelse(bp);
+    return addr;
+  }
+  bn -= NINDIRECT;
+  struct buf *bp_2;
+  uint *a_2;
+  if(bn < NTWOINDIRECT)
+  {
+    //获得二级间接块的地址，若为0就分配
+    if((addr = ip->addrs[NDIRECT+1]) == 0)
+      ip->addrs[NDIRECT+1] = addr = balloc(ip->dev);
+    bp_2 = bread(ip->dev, addr);  //根据地址读二级间接块
+    a_2 = (uint*)bp_2->data;  //二级间接块的数据指针
+    if((addr = a_2[bn/NINDIRECT]) == 0)
+    {
+      //根据指针从相应偏移量处获得一级间接块地址，若为0就分配
+      a_2[bn/NINDIRECT] = addr = balloc(ip->dev);
+      log_write(bp_2);
+    }
+    //获得一级间接块地址后释放二级间接块
+    brelse(bp_2);
+    bp = bread(ip->dev, addr);//读一级间接块
+    a = (uint*)bp->data;  //一级间接块的数据指针
+    if((addr = a[bn%NINDIRECT]) == 0)
+    {
+//根据指针从相应偏移量处获得数据块地址，若为0就分配
+      a[bn%NINDIRECT] = addr = balloc(ip->dev);
+      log_write(bp);
+    }
+    //获得数据块地址后释放一级间接块并返回
+    brelse(bp);
+    return addr;
+  }
+  panic("bmap: out of range");
+}
+
+ 
+ 
+3.	在 kernel/fs.c 中修改 itrunc 函数，添加二级间接块的释放逻辑：
+
+void
+itrunc(struct inode *ip)
+{
+  int i, j;
+  struct buf *bp,*bp_2;
+  uint *a,*a_2;
+  for(i = 0; i < NDIRECT; i++)
+  {
+    if(ip->addrs[i])
+    {
+//遍历所有直接块地址，若不为0就释放然后设为0
+      bfree(ip->dev, ip->addrs[i]);
+      ip->addrs[i] = 0;
+    }
+  }
+  if(ip->addrs[NDIRECT])
+  {
+//一级间接块不为0
+    bp = bread(ip->dev, ip->addrs[NDIRECT]);  //读一级间接块
+    a = (uint*)bp->data;  //一级间接块的数据指针
+    for(j = 0; j < NINDIRECT; j++)
+    {
+//释放一级间接块下的所有数据块
+      if(a[j])
+        bfree(ip->dev, a[j]);
+    }
+//释放一级间接块本身
+    brelse(bp);
+    bfree(ip->dev, ip->addrs[NDIRECT]);
+    ip->addrs[NDIRECT] = 0;
+  }
+  if(ip->addrs[NDIRECT+1])
+  {
+//二级间接块不为0
+    bp_2 = bread(ip->dev, ip->addrs[NDIRECT+1]);  //读二级间接块
+    a_2 = (uint*)bp_2->data;  //二级间接块的数据指针
+    for(i = 0; i < NINDIRECT; i++)
+    {
+//遍历二级间接块下的所有一级间接块
+      if(a_2[i])
+      {
+//该一级间接块不为空
+        bp = bread(ip->dev, a_2[i]);
+        a = (uint*)bp->data;
+        for(j = 0; j < NINDIRECT; j++)
+        {
+          if(a[j])
+            bfree(ip->dev, a[j]);
+        }
+ //释放一级间接块本身
+        brelse(bp);
+        bfree(ip->dev, a_2[i]);
+        a_2[i] = 0;
+      }
+    }
+//释放二级间接块本身
+    brelse(bp_2);
+    bfree(ip->dev, ip->addrs[NDIRECT+1]);
+    ip->addrs[NDIRECT+1] = 0;
+  }
+  ip->size = 0;
+  iupdate(ip);
+}
+
+ 
+ 
+4.	编译和测试：
+
+make clean
+make qemu
+
+$ bigfile
+
+ 
+三．	实验4.2 符号链接
+1.	添加系统调用号和声明：
+
+// kernel/syscall.h
+// 添加系统调用号
+#define SYS_symlink  22
+
+//kernel/syscall.c
+// 在 extern 声明部分添加
+extern uint64 sys_symlink(void);
+// 在系统调用函数指针数组中添加
+[SYS_symlink]   sys_symlink,
+
+//user/user.h
+// 在系统调用声明部分添加
+int symlink(const char *target, const char *path);
+
+//user/usys.pl
+# 在入口列表中添加
+entry("symlink");
+ 
+2.	定义符号链接类型和标志位：
+
+//kernel/stat.h
+#define T_SYMLINK 4   // 符号链接文件类型
+
+//kernel/fcntl.h
+#define O_NOFOLLOW 0x800  // 不跟随符号链接
+
+ 
+3.	在 kernel/sysfile.c 文件中添加 sys_symlink 函数：
+
+uint64
+sys_symlink(void)
+{
+  char target[MAXPATH];
+  char path[MAXPATH];
+  struct inode *ip;
+  // 从用户空间获取参数
+  if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0){
+    return -1;
+  }
+  // 开始文件系统操作
+  begin_op();
+  // 创建符号链接文件
+  ip = create(path, T_SYMLINK, 0, 0);
+  if(ip == 0)
+  {
+    end_op();
+    return -1;
+  }
+  // 将目标路径写入符号链接文件的数据块中
+  if(writei(ip, 0, (uint64)target, 0, MAXPATH) < MAXPATH)
+  {
+    // 写入失败，需要清理
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+  iunlockput(ip);
+  end_op();
+  return 0;
+}
+
+ 
+4.	在 kernel/sysfile.c 的 sys_open 函数中添加符号链接处理逻辑：
+ 
+// 符号链接处理：如果文件是符号链接且没有设置 O_NOFOLLOW 标志
+  if(ip->type == T_SYMLINK && !(omode & O_NOFOLLOW))
+  {
+    // 这是个符号链接文件并且确定要follow
+    int depth = 10;  // 最大递归深度
+    char target[MAXPATH];
+    for(int i = 0; i < depth; i++)
+    {
+      // 从符号链接文件的数据块中读取出路径target
+      if(readi(ip, 0, (uint64)target, 0, MAXPATH) != MAXPATH)
+      {
+        iunlockput(ip);
+        end_op();
+        return -1;
+      }
+      // 原本的符号链接文件已经不需要了，释放它的锁
+      iunlockput(ip);
+      // 得到了target，解析路径得到目标文件的inode
+      if((ip = namei(target)) == 0)
+      {
+        end_op();
+        return -1;
+      }
+      ilock(ip);
+      // 如果目标文件不再是符号链接，停止循环
+      if(ip->type != T_SYMLINK)
+        break; 
+      // 检查是否超过最大递归深度
+      if(i == depth - 1)
+      {
+        iunlockput(ip);
+        end_op();
+        return -1;    
+      }
+    }
+  }
+
+ 
+5.	修改 Makefile，在 UPROGS 部分添加：
+
+$U/_symlinktest\
+
+ 
+6.	编译和测试：
+
+make clean
+make qemu
+
+$ symlinktest
+
+ 
+四．	实验主观心得
+本次实验中，在和AI智斗了很久后，终于走出AI，然后发现AI世界外的代码清晰很多（这次的实验代码都来自于网上的大佬，自己的代码基础实在是太差了，基本很难独立写出代码）。AI给我提供的很多解决方案在理论上可行，但实际上却无法出结果。然后去网上一查，再 结合AI解释，发现好几个问题其实用简单的思路就能解决（大佬写得代码还清晰易懂， AI的代码就没这种效果）。
+仍然感谢AI的帮助。
