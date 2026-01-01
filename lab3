@@ -1,0 +1,349 @@
+一．	实验环境准备
+
+git fetch
+git checkout pgtbl
+make clean
+
+
+二．	实验3.1 系统调用性能优化
+1.	修改进程结构体。在kernel/proc.h中找到struct proc，在其中添加usyscall 指针：
+
+	struct usyscall *usyscall;  // 用户系统调用页面
+
+ 
+2.	修改 allocproc 函数。在kernel/proc.c中找到allocproc 函数，在其中添加 USYSCALL 页面的分配和初始化：
+
+// 分配 USYSCALL 页面
+  if((p->usyscall = (struct usyscall *)kalloc()) == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+  p->usyscall->pid = p->pid;  // 初始化 pid
+
+ 
+3.	修改 proc_pagetable 函数。在kernel/proc.c中添加 USYSCALL 页面的映射：
+
+// 映射 USYSCALL 页面
+  if(mappages(pagetable, USYSCALL, PGSIZE,
+              (uint64)(p->usyscall), PTE_R | PTE_U) < 0){
+    uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+    uvmunmap(pagetable, TRAPFRAME, 1, 0);
+    uvmfree(pagetable, 0);
+    return 0;
+  }
+
+ 
+4.	修改 freeproc 函数，释放 USYSCALL 页面：
+
+if(p->usyscall)
+    kfree((void*)p->usyscall);  // 释放 USYSCALL 页面
+  p->usyscall = 0;
+
+
+5.	修改 proc_freepagetable 函数，取消 USYSCALL 页面的映射：
+
+uvmunmap(pagetable, USYSCALL, 1, 0);  // 取消映射 USYSCALL
+
+
+6.	编译并测试：
+
+make qemu
+pgtbltest
+  
+ 
+三．	实验3.2 打印进程 1 的页表
+1.	在kernel/vm.c中实现 vmprint 函数：
+// 递归打印页表
+void
+vmprint_rec(pagetable_t pagetable, int level)
+{
+  // 遍历页表中的所有 PTE
+  for(int i = 0; i < 512; i++){
+    pte_t pte = pagetable[i];
+    if(pte & PTE_V){
+      // 打印当前 PTE，根据层级打印不同的前缀
+      for(int j = 0; j < level; j++) {
+        printf(".. ");
+      }
+      uint64 child = PTE2PA(pte);
+      printf("..%d: pte %p pa %p\n", i, pte, child);
+      
+      // 如果当前不是叶子节点，递归打印下一级
+      if((pte & (PTE_R|PTE_W|PTE_X)) == 0){
+        vmprint_rec((pagetable_t)child, level + 1);
+      }
+    }
+  }
+}
+
+void
+vmprint(pagetable_t pagetable)
+{
+  printf("page table %p\n", pagetable);
+  vmprint_rec(pagetable, 1);
+}
+ 
+2.	在 kernel/defs.h 中声明函数：
+
+void            vmprint(pagetable_t);
+
+ 
+3.	在 exec 中调用 kernel/vmprint，在 exec 函数末尾添加以下代码：
+
+// 在返回用户空间之前，如果是进程 1，则打印页表
+  if(p->pid == 1) {
+    vmprint(p->pagetable);
+  }
+
+4.	运行测试，发现问题：
+问题1：error: conflicting types for 'vmprint'（在 defs.h 中声明的 vmprint 只有一个参数：void vmprint(pagetable_t)，但在 vm.c 中定义的 vmprint 有两个参数：void vmprint(pagetable_t pagetable, int level)）
+问题2：error: format '%p' expects argument of type 'void *'（%p 需要 void* 类型参数，但传递的是 pte_t 和 uint64 类型）
+问题3：error: implicit declaration of function 'vmprint_rec'（编译器找不到 vmprint_rec 函数的声明）
+解决方法：
+1)	将所有 %p 格式的参数转换为 (void*)：
+ 
+2)	在 kernel/defs.h 中添加递归函数声明：
+
+void vmprint_rec(pagetable_t, int);
+
+ 
+5.	重新编译运行
+
+
+四．	实验3.3 为xv6添加超级页支持
+1．	在kernel/kalloc.c 中添加超级页分配器：
+
+// 超级页分配器
+void*
+superalloc(void)
+{
+  // 分配 512 个连续的 4KB 页面来组成一个 2MB 超级页
+  char *first = kalloc();
+  if(first == 0)
+    return 0;
+  
+  // 检查是否 2MB 对齐
+  if((uint64)first % (2*1024*1024) != 0) {
+    kfree(first);
+    return 0;
+  }
+  
+  // 分配剩余的 511 个页面
+  for(int i = 1; i < 512; i++) {
+    char *page = kalloc();
+    if(page == 0) {
+      // 分配失败，释放之前分配的页面
+      for(int j = 0; j < i; j++) {
+        kfree((void*)((uint64)first + j * PGSIZE));
+      }
+      return 0;
+    }
+  }
+  
+  return first;
+}
+
+void
+superfree(void *pa)
+{
+  // 释放 512 个连续的 4KB 页面
+  for(int i = 0; i < 512; i++) {
+    kfree((void*)((uint64)pa + i * PGSIZE));
+  }
+}
+
+ 
+2．	在kernel/vm.c中添加超级页映射和修改相关函数：
+先在文件开头添加辅助函数：
+
+// 检查是否可以使用超级页
+int
+can_use_superpage(uint64 va, uint64 size)
+{
+  return (size >= PGSIZE * 512) && ((va & (PGSIZE * 512 - 1)) == 0);
+}
+
+// 检查 PTE 是否是超级页
+int
+is_superpage(pte_t pte)
+{
+  return (pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X));
+}
+
+ 
+然后添加超级页映射函数：
+
+// 映射超级页
+int
+supermappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
+{
+  if((va % (PGSIZE * 512)) != 0)
+    panic("supermappages: va not aligned");
+  
+  if((pa % (PGSIZE * 512)) != 0)
+    panic("supermappages: pa not aligned");
+  
+  // 对于超级页 只需要在 L1 级别创建一个 PTE
+  pte_t *pte = walk(pagetable, va, 1);
+  if(pte == 0)
+    return -1;
+  if(*pte & PTE_V)
+    panic("supermappages: remap");
+  
+  *pte = PA2PTE(pa) | perm | PTE_V;
+  return 0;
+}
+
+ 
+找到现有的 uvmalloc 函数，修改为：
+
+uint64
+uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
+{
+  char *mem;
+  uint64 a;
+
+  if(newsz < oldsz)
+    return oldsz;
+
+  oldsz = PGROUNDUP(oldsz);
+  for(a = oldsz; a < newsz; a += PGSIZE){
+    
+    // 检查是否可以使用超级页
+    if(can_use_superpage(a, newsz - a)) {
+      mem = (char*)superalloc();
+      if(mem == 0){
+        uvmdealloc(pagetable, a, oldsz);
+        return 0;
+      }
+      memset(mem, 0, PGSIZE * 512);
+      if(supermappages(pagetable, a, PGSIZE * 512, (uint64)mem, 
+                      PTE_R|PTE_W|PTE_U|xperm) != 0){
+        superfree(mem);
+        uvmdealloc(pagetable, a, oldsz);
+        return 0;
+      }
+      a += PGSIZE * 512 - PGSIZE; // 跳过 2MB
+      continue;
+    }
+    
+    // 原有的 4KB 页面分配
+    mem = kalloc();
+    if(mem == 0){
+      uvmdealloc(pagetable, a, oldsz);
+      return 0;
+    }
+    memset(mem, 0, PGSIZE);
+    if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_R|PTE_W|PTE_U|xperm) != 0){
+      kfree(mem);
+      uvmdealloc(pagetable, a, oldsz);
+      return 0;
+    }
+  }
+  return newsz;
+}
+
+ 
+修改 uvmunmap 函数：
+
+void
+uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+{
+  uint64 a;
+  pte_t *pte;
+
+  for(a = va; a < va + npages * PGSIZE; a += PGSIZE){
+    if((pte = walk(pagetable, a, 0)) == 0)
+      panic("uvmunmap: walk");
+    if((*pte & PTE_V) == 0)
+      panic("uvmunmap: not mapped");
+    
+    // 检查是否是超级页
+    if(is_superpage(*pte)) {
+      uint64 pa = PTE2PA(*pte);
+      if(do_free){
+        superfree((void*)pa);
+      }
+      *pte = 0;
+      a += PGSIZE * 512 - PGSIZE; // 跳过 2MB
+    } else {
+      uint64 pa = PTE2PA(*pte);
+      if(do_free){
+        kfree((void*)pa);
+      }
+      *pte = 0;
+    }
+  }
+}
+
+ 
+修改 uvmcopy 函数：
+
+int
+uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+{
+  pte_t *pte;
+  uint64 pa, i;
+  uint flags;
+
+  for(i = 0; i < sz; i += PGSIZE){
+    if((pte = walk(old, i, 0)) == 0)
+      panic("uvmcopy: pte should exist");
+    if((*pte & PTE_V) == 0)
+      panic("uvmcopy: page not present");
+    
+    pa = PTE2PA(*pte);
+    flags = PTE_FLAGS(*pte);
+    
+    // 检查是否是超级页
+    if(is_superpage(*pte)) {
+      // 分配新的超级页
+      char *mem = superalloc();
+      if(mem == 0)
+        goto err;
+      memmove(mem, (char*)pa, PGSIZE * 512);
+      if(supermappages(new, i, PGSIZE * 512, (uint64)mem, flags) != 0){
+        superfree(mem);
+        goto err;
+      }
+      i += PGSIZE * 512 - PGSIZE; // 跳过 2MB
+    } else {
+      // 原有的 4KB 页面复制
+      char *mem = kalloc();
+      if(mem == 0)
+        goto err;
+      memmove(mem, (char*)pa, PGSIZE);
+      if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+        kfree(mem);
+        goto err;
+      }
+    }
+  }
+  return 0;
+
+ err:
+  uvmunmap(new, 0, i / PGSIZE, 1);
+  return -1;
+}
+
+ 
+ 
+3．	在kernel/defs.h中添加函数声明：
+
+// kalloc.c
+void*           superalloc(void);
+void            superfree(void*);
+
+// vm.c
+int             can_use_superpage(uint64, uint64);
+int             is_superpage(pte_t);
+int             supermappages(pagetable_t, uint64, uint64, uint64, int);
+
+ 
+4．	编译运行：
+失败。失败。失败。。。系统一直在崩溃，一直提示内核在启动时发生了内核陷阱，改了好几版代码，已经改得头昏脑涨、无法理解，以上是最后一版，实在没办法了。。。先这样吧。
+
+五．	实验主观心得
+在开始实验时，由于对xv6的构建系统不熟悉，遇到了多次编译错误。特别是在切换pgtbl分支时，由于有未提交的修改，git阻止了分支切换。通过AI的帮助，我学会了使用git stash和git commit来管理代码版本。然后就是USYSCALL页面映射的实现，之前只是在理论上知道TRAMPOLINE和TRAPFRAME的作用，现在亲手实现了类似的USYSCALL区域，对进程地址空间的管理有了更直观的认识。超级页实现是本次实验中最困难的部分，让我更加体会到了单纯写代码而不理解原理容易陷入盲目调试的感觉（但是好像理解了也做不出来。。。理解不到位吧）。
+最后热烈感谢一下本次实验中AI提供的帮助！通过AI，我理解到了很多陌生的概念；当出现错误时，AI也能帮助我分析错误信息并提供解决方案（虽然最终没有解决如何实现超级页）。
